@@ -4,166 +4,2085 @@
 #include <ctype.h>
 #include "hash.h"
 #include "list.h"
-#define IMPORT_LINE_SIZE 128
-#define MAX_LEN 64
+#include "direct_methods.h"
+#include "blas.h"
+#include "csparse.h"
+#define INITIAL_SIZE 10000
+#define IMPORT_LINE_SIZE 1024
+#define MAX_LEN 36
+#define MAX_LEN_SP 96
 
 typedef struct {
-	double** A;
-	double* b;
-	int m1, m2;
+	double** A; //array for i,v,l,r
+	double** B; //array for l,c
+	cs* B_sp; //sparse version of B
+	cs* A_sp; //sparse version of A
+	cs* C; //compressed column version of A_sp
+	cs* D; //compressed column version of B_sp
+	double* b; //dc operation point b
+	double* x0; //dc solution/ initial tran solution
+	int m1, m2; //m1: #nodes - 1 (gnd), m2: #i,l
 }dc_mna_t;
 
-dc_mna_t create_mna_dc(list_t* list, ht_t* ht, int m1, int m2){
-	int m2_counter = 0;
+
+
+
+//arrays for sparse direct methods
+css *S = NULL;
+csn *N = NULL;
+
+
+//splits the src_str to two new strings str1, str2, based on the delimeter
+void split_string(char* src_str, char* str1, char* str2, char delimeter){
+	int i,j, str_len = strlen(src_str);
+	
+	for(i = 0; i < str_len; i++){
+		if(src_str[i] == delimeter)
+			break;
+		
+		str1[i]	= src_str[i];	
+	}
+	
+	str1[i] = '\0';
+	
+	for(j = i+1; j < str_len; j++){
+		str2[j - i - 1] = src_str[j];
+	}
+	
+	str2[j- i - 1] = '\0';
+}
+
+
+dc_mna_t create_mna_dc(list_t* list, ht_t* ht, int m1, int m2, bool is_sparse){
+	int m2_counter = 0, ka=0, kb = 0;
 	dc_mna_t dc_mna;
 	dc_mna.m1 = m1;
 	dc_mna.m2 = m2;
-	dc_mna.A = (double**)calloc((m1+m2), sizeof(double*));
 	dc_mna.b = (double*)calloc((m1+m2), sizeof(double));
+	dc_mna.x0 = (double*)calloc((m1+m2), sizeof(double));
 	node_t* curr = list->head;
 	
-	for(int i=0; i < (m1+m2); i++){
-		dc_mna.A[i] = (double*)calloc((m1+m2), sizeof(double));
-	}
-	
-	while(curr != NULL){
-		int node1_code = lookup(ht, curr->node1);
-		int node2_code = lookup(ht, curr->node2);
-		switch(curr->el){
-			case 'v':
-				if(node1_code >= 0){
-					if(node2_code >= 0){
-						dc_mna.A[dc_mna.m1 + m2_counter][node1_code] += 1;
-						dc_mna.A[dc_mna.m1 + m2_counter][node2_code] -= 1;
-						dc_mna.A[node2_code][dc_mna.m1 + m2_counter] -= 1;
-						dc_mna.A[node1_code][dc_mna.m1 + m2_counter] += 1;
-					} else {
-						dc_mna.A[dc_mna.m1 + m2_counter][node1_code] += 1;
-						dc_mna.A[node1_code][dc_mna.m1 + m2_counter] += 1;
-					}
-				} else{
-					if(node2_code >= 0){
-						dc_mna.A[dc_mna.m1 + m2_counter][node2_code] -= 1;
-						dc_mna.A[node2_code][dc_mna.m1 + m2_counter] -= 1;	
-					}
-					//else add nothing
-				}
-				dc_mna.b[dc_mna.m1 + m2_counter] += curr->val; 
-				m2_counter++;
-				break;
-			case 'i':
-				if(node1_code >= 0) {
-					if(node2_code >= 0) {
-						dc_mna.b[node1_code] -= curr->val;
-						dc_mna.b[node2_code] += curr->val;
-					} else {
-						dc_mna.b[node1_code] -= curr->val;	
-					}
-				} else {
-					if(node2_code >=0) {
-						dc_mna.b[node2_code] += curr->val;
-					}
-				}
-				break;
-			case 'r':
-				if(node1_code >= 0) {
-					if(node2_code >= 0) {
-						dc_mna.A[node1_code][node1_code] += 1/curr->val;
-						dc_mna.A[node1_code][node2_code] -= 1/curr->val;
-						dc_mna.A[node2_code][node1_code] -= 1/curr->val;
-						dc_mna.A[node2_code][node2_code] += 1/curr->val;	
-					} else {
-						dc_mna.A[node1_code][node1_code] += 1/curr->val;	
-					}
-				} else {
-					if(node2_code >=0) {
-						dc_mna.A[node2_code][node2_code] -= 1/curr->val;
-					}
-				}
-				break;
-			case 'c':
-				break;
-			case 'l':
-				if(node1_code >= 0){
-					if(node2_code >= 0){
-						dc_mna.A[dc_mna.m1 + m2_counter][node1_code] += 1;
-						dc_mna.A[dc_mna.m1 + m2_counter][node2_code] -= 1;
-						dc_mna.A[node2_code][dc_mna.m1 + m2_counter] -= 1;
-						dc_mna.A[node1_code][dc_mna.m1 + m2_counter] += 1;
-					} else {
-						dc_mna.A[dc_mna.m1 + m2_counter][node1_code] += 1;
-						dc_mna.A[node1_code][dc_mna.m1 + m2_counter] += 1;
-					}
-				} else{
-					if(node2_code >= 0){
-						dc_mna.A[dc_mna.m1 + m2_counter][node2_code] -= 1;
-						dc_mna.A[node2_code][dc_mna.m1 + m2_counter] -= 1;	
-					}
-					//else add nothing
-				}
-				m2_counter++;
-				break;
-			default:
-				break;
+	printf("Creating dc mna...\n");
+	if(!is_sparse){
+		dc_mna.A = (double**)calloc((m1+m2), sizeof(double*));
+		dc_mna.B = (double**)calloc((m1+m2), sizeof(double*));
+		for(int i=0; i < (m1+m2); i++){
+			dc_mna.A[i] = (double*)calloc((m1+m2), sizeof(double));
+			dc_mna.B[i] = (double*)calloc((m1+m2), sizeof(double));
 		}
 		
-		curr = curr->nxt;
+		while(curr != NULL){
+			int node1_code = lookup(ht, curr->node1);
+			int node2_code = lookup(ht, curr->node2);
+			switch(curr->el){
+				case 'v':
+					if(node1_code >= 0){
+						if(node2_code >= 0){
+							
+							dc_mna.A[dc_mna.m1 + m2_counter][node1_code] += 1;
+							dc_mna.A[dc_mna.m1 + m2_counter][node2_code] -= 1;
+							dc_mna.A[node2_code][dc_mna.m1 + m2_counter] -= 1;
+							dc_mna.A[node1_code][dc_mna.m1 + m2_counter] += 1;
+							
+						} else {
+							dc_mna.A[dc_mna.m1 + m2_counter][node1_code] += 1;
+							dc_mna.A[node1_code][dc_mna.m1 + m2_counter] += 1;
+						}
+					} else{
+						if(node2_code >= 0){
+							dc_mna.A[dc_mna.m1 + m2_counter][node2_code] -= 1;
+							dc_mna.A[node2_code][dc_mna.m1 + m2_counter] -= 1;
+						}
+						//else add nothing
+					}
+					dc_mna.b[dc_mna.m1 + m2_counter] += curr->val;
+					m2_counter++;
+					break;
+				case 'i':
+					if(node1_code >= 0) {
+						if(node2_code >= 0) {
+							dc_mna.b[node1_code] -= curr->val;
+							dc_mna.b[node2_code] += curr->val;
+						} else {
+							dc_mna.b[node1_code] -= curr->val;
+						}
+					} else {
+						if(node2_code >=0) {
+							dc_mna.b[node2_code] += curr->val;
+						}
+					}
+					break;
+				case 'r':
+					if(node1_code >= 0) {
+						if(node2_code >= 0) {
+							dc_mna.A[node1_code][node1_code] += 1/curr->val;
+							dc_mna.A[node1_code][node2_code] -= 1/curr->val;
+							dc_mna.A[node2_code][node1_code] -= 1/curr->val;
+							dc_mna.A[node2_code][node2_code] += 1/curr->val;
+						} else {
+							dc_mna.A[node1_code][node1_code] += 1/curr->val;
+						}
+					} else {
+						if(node2_code >=0) {
+							dc_mna.A[node2_code][node2_code] += 1/curr->val;
+						}
+					}
+					break;
+				case 'c':
+					if(node1_code >= 0) {
+						if(node2_code >= 0) {
+							dc_mna.B[node1_code][node1_code] += curr->val;
+							dc_mna.B[node1_code][node2_code] -= curr->val;
+							dc_mna.B[node2_code][node1_code] -= curr->val;
+							dc_mna.B[node2_code][node2_code] += curr->val;
+						} else {
+							dc_mna.B[node1_code][node1_code] += curr->val;
+						}
+					} else {
+						if(node2_code >=0) {
+							dc_mna.B[node2_code][node2_code] += curr->val;
+						}
+					}
+					break;
+				case 'l':
+					if(node1_code >= 0){
+						if(node2_code >= 0){
+							dc_mna.A[dc_mna.m1 + m2_counter][node1_code] += 1;
+							dc_mna.A[dc_mna.m1 + m2_counter][node2_code] -= 1;
+							dc_mna.A[node2_code][dc_mna.m1 + m2_counter] -= 1;
+							dc_mna.A[node1_code][dc_mna.m1 + m2_counter] += 1;
+						} else {
+							dc_mna.A[dc_mna.m1 + m2_counter][node1_code] += 1;
+							dc_mna.A[node1_code][dc_mna.m1 + m2_counter] += 1;
+						}
+					} else{
+						if(node2_code >= 0){
+							dc_mna.A[dc_mna.m1 + m2_counter][node2_code] -= 1;
+							dc_mna.A[node2_code][dc_mna.m1 + m2_counter] -= 1;
+						}
+						//else add nothing
+					}
+					dc_mna.B[dc_mna.m1 + m2_counter][dc_mna.m1 + m2_counter] = -curr->val;
+					m2_counter++;
+					break;
+				default:
+					break;
+			}
+			
+			curr = curr->nxt;
+		}
+	}
+	else {
+		int nz = get_nz(*list,'A');
+		dc_mna.A_sp=cs_spalloc(m1+m2,m1+m2,nz,1,1);
+		dc_mna.A_sp->nz=nz;
+		
+		nz = get_nz(*list,'B');
+		dc_mna.B_sp=cs_spalloc(m1+m2,m1+m2,nz,1,1);
+		dc_mna.B_sp->nz=nz;
+		
+		while(curr != NULL){
+			int node1_code = lookup(ht, curr->node1);
+			int node2_code = lookup(ht, curr->node2);
+			switch(curr->el){
+				case 'v':
+					if(node1_code >= 0){
+						if(node2_code >= 0){
+							dc_mna.A_sp->i[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->p[ka] = node1_code;
+							dc_mna.A_sp->x[ka] = 1;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->p[ka] = node2_code;
+							dc_mna.A_sp->x[ka] = -1;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = node2_code;
+							dc_mna.A_sp->p[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->x[ka] = -1;
+							ka++;		
+							
+							dc_mna.A_sp->i[ka] = node1_code;
+							dc_mna.A_sp->p[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->x[ka] = 1;
+							ka++;
+							
+							
+						} else {
+							dc_mna.A_sp->i[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->p[ka] = node1_code;
+							dc_mna.A_sp->x[ka] = 1;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = node1_code;
+							dc_mna.A_sp->p[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->x[ka] = 1;
+							ka++;
+							
+						}
+					} else{
+						if(node2_code >= 0){
+							dc_mna.A_sp->i[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->p[ka] = node2_code;
+							dc_mna.A_sp->x[ka] = -1;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = node2_code;
+							dc_mna.A_sp->p[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->x[ka] = -1;
+							ka++;
+						}
+						//else add nothing
+					}
+					dc_mna.b[dc_mna.m1 + m2_counter] += curr->val;
+					m2_counter++;
+					break;
+				case 'i':
+					if(node1_code >= 0) {
+						if(node2_code >= 0) {
+							dc_mna.b[node1_code] -= curr->val;
+							dc_mna.b[node2_code] += curr->val;
+						} else {
+							dc_mna.b[node1_code] -= curr->val;
+						}
+					} else {
+						if(node2_code >=0) {
+							dc_mna.b[node2_code] += curr->val;
+						}
+					}
+					break;
+				case 'r':
+					if(node1_code >= 0) {
+						if(node2_code >= 0) {
+							
+							dc_mna.A_sp->i[ka] = node1_code;
+							dc_mna.A_sp->p[ka] = node1_code;
+							dc_mna.A_sp->x[ka] = 1/curr->val;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = node1_code;
+							dc_mna.A_sp->p[ka] = node2_code;
+							dc_mna.A_sp->x[ka] = -1/curr->val;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = node2_code;
+							dc_mna.A_sp->p[ka] = node1_code;
+							dc_mna.A_sp->x[ka] = -1/curr->val;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = node2_code;
+							dc_mna.A_sp->p[ka] = node2_code;
+							dc_mna.A_sp->x[ka] = 1/curr->val;
+							ka++;
+								
+						} else {
+							dc_mna.A_sp->i[ka] = node1_code;
+							dc_mna.A_sp->p[ka] = node1_code;
+							dc_mna.A_sp->x[ka] = 1/curr->val;
+							ka++;
+							
+						}
+					} else {
+						if(node2_code >=0) {
+							dc_mna.A_sp->i[ka] = node2_code;
+							dc_mna.A_sp->p[ka] = node2_code;
+							dc_mna.A_sp->x[ka] = 1/curr->val;
+							ka++;
+						}
+					}
+					break;
+				case 'c':
+					if(node1_code >= 0) {
+						if(node2_code >= 0) {
+							
+							dc_mna.B_sp->i[kb] = node1_code;
+							dc_mna.B_sp->p[kb] = node1_code;
+							dc_mna.B_sp->x[kb] = curr->val;
+							kb++;
+							
+							dc_mna.B_sp->i[kb] = node1_code;
+							dc_mna.B_sp->p[kb] = node2_code;
+							dc_mna.B_sp->x[kb] = -curr->val;
+							kb++;
+							
+							dc_mna.B_sp->i[kb] = node2_code;
+							dc_mna.B_sp->p[kb] = node1_code;
+							dc_mna.B_sp->x[kb] = -curr->val;
+							kb++;
+							
+							dc_mna.B_sp->i[kb] = node2_code;
+							dc_mna.B_sp->p[kb] = node2_code;
+							dc_mna.B_sp->x[kb] = curr->val;
+							kb++;
+								
+						} else {
+							dc_mna.B_sp->i[kb] = node1_code;
+							dc_mna.B_sp->p[kb] = node1_code;
+							dc_mna.B_sp->x[kb] = curr->val;
+							kb++;
+							
+						}
+					} else {
+						if(node2_code >=0) {
+							dc_mna.B_sp->i[kb] = node2_code;
+							dc_mna.B_sp->p[kb] = node2_code;
+							dc_mna.B_sp->x[kb] = curr->val;
+							kb++;
+						}
+					}
+					break;
+				case 'l':
+					if(node1_code >= 0){
+						if(node2_code >= 0){
+							dc_mna.A_sp->i[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->p[ka] = node1_code;
+							dc_mna.A_sp->x[ka] = 1;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->p[ka] = node2_code;
+							dc_mna.A_sp->x[ka] = -1;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = node2_code;
+							dc_mna.A_sp->p[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->x[ka] = -1;
+							ka++;		
+							
+							dc_mna.A_sp->i[ka] = node1_code;
+							dc_mna.A_sp->p[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->x[ka] = 1;
+							ka++;
+							
+							
+						} else {
+							dc_mna.A_sp->i[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->p[ka] = node1_code;
+							dc_mna.A_sp->x[ka] = 1;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = node1_code;
+							dc_mna.A_sp->p[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->x[ka] = 1;
+							ka++;
+						}
+					} else{
+						if(node2_code >= 0){
+							dc_mna.A_sp->i[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->p[ka] = node2_code;
+							dc_mna.A_sp->x[ka] = -1;
+							ka++;
+							
+							dc_mna.A_sp->i[ka] = node2_code;
+							dc_mna.A_sp->p[ka] = dc_mna.m1 + m2_counter;
+							dc_mna.A_sp->x[ka] = -1;
+							ka++;			
+						}
+						//else add nothing
+					}
+					dc_mna.B_sp->i[kb] = dc_mna.m1 + m2_counter;
+					dc_mna.B_sp->p[kb] = dc_mna.m1 + m2_counter;
+					dc_mna.B_sp->x[kb] = -curr->val;
+					kb++;
+					
+					m2_counter++;
+					break;
+				default:
+					break;
+			}
+			
+			curr = curr->nxt;
+		}
+		
+		dc_mna.C = cs_compress(dc_mna.A_sp);
+		dc_mna.D = cs_compress(dc_mna.B_sp);
+		cs_spfree(dc_mna.A_sp);
+		cs_spfree(dc_mna.B_sp);
+		if(!cs_dupl(dc_mna.C) || !cs_dupl(dc_mna.D)){
+			printf("Error, cannot compress mna!\n");
+		}
 	}
 	
 	return dc_mna;
 }
 
 void print_mna_dc(dc_mna_t dc_mna){
-	printf("-----MNA DC ANALYSIS----\n");
-	printf("m1 elements = %d\nm2 elements = %d\n", dc_mna.m1, dc_mna.m2);
+	printf("\n-----MNA DC ANALYSIS----\n");
+	printf("n-1 = %d\nm2 elements = %d\n", dc_mna.m1, dc_mna.m2);
 	
 	
 	printf("----------A------------\n");
 	
 	for(int i=0; i < (dc_mna.m1 + dc_mna.m2); i++){
 		for(int j=0; j < (dc_mna.m1+ dc_mna.m2); j++){
-			printf("%.6f ", dc_mna.A[i][j]);
+			printf("% 11.5f ", dc_mna.A[i][j]);
 		}
 		printf("\n");
 	}
 	
-	printf("\n----------B------------\n");
+	printf("\n----------b------------\n");
 	for(int i=0; i < (dc_mna.m1 + dc_mna.m2); i++){
-		printf("%.6f ", dc_mna.b[i]);
+		printf("% 11.5f ", dc_mna.b[i]);
 	}
 	printf("\n");
 }
 
-void delete_mna_dc(dc_mna_t dc_mna){
-	for(int i=0; i < (dc_mna.m1 + dc_mna.m2); i++){
-		free(dc_mna.A[i]);
+void delete_mna_dc(dc_mna_t dc_mna, bool is_sparse, bool is_iter){
+	
+	if(!is_sparse){
+		for(int i=0; i < (dc_mna.m1 + dc_mna.m2); i++){
+			free(dc_mna.A[i]);
+		}
+		free(dc_mna.A);	
+	}
+	else{
+		cs_spfree(dc_mna.C);
 	}
 	
-	free(dc_mna.A);
 	free(dc_mna.b);
+	free(dc_mna.x0);
 }
 
 
+void sparse_lu_dec(dc_mna_t dc_mna){
+	S=cs_sqr(2,dc_mna.C,0);
+	if(S == NULL){
+		printf("S is null\n!");
+	}
+	N=cs_lu(dc_mna.C,S,1);
+	if(N == NULL){
+		printf("N is null\n!");
+	}
+}
+
+void sparse_tran_lu_dec(cs* A_tran){
+	S=cs_sqr(2,A_tran,0);
+	if(S == NULL){
+		printf("S is null\n!");
+	}
+	N=cs_lu(A_tran,S,1);
+	if(N == NULL){
+		printf("N is null\n!");
+	}
+}
+
+void sparse_chol_dec(dc_mna_t dc_mna){
+	S=cs_schol(1,dc_mna.C);
+	if(S == NULL){
+		printf("S is null\n!");
+	}
+	N=cs_chol(dc_mna.C,S);
+	if(N == NULL){
+		printf("N is null\n!");
+	}
+}
+
+void sparse_tran_chol_dec(cs* A_tran){
+	S=cs_schol(1,A_tran);
+	if(S == NULL){
+		printf("S is null\n!");
+	}
+	N=cs_lu(A_tran,S,1);
+	if(N == NULL){
+		printf("N is null\n!");
+	}
+}
+
+void sparse_lu_solve(double* b, double* y, int n){
+	cs_ipvec(N->pinv,b,y,n);
+	cs_lsolve(N->L,y);
+	cs_usolve(N->U,y);
+	cs_ipvec(S->q,y,b,n);
+}
+
+void sparse_chol_solve(double* b, double* y, int n){
+	cs_ipvec(S->pinv,b,y,n);
+	cs_lsolve(N->L,y);
+	cs_ltsolve(N->L,y);
+	cs_pvec(S->pinv,y,b,n);
+}
+
+
+void solve_direct_dcop(ht_t *ht, dc_mna_t dc_mna, bool is_spd, double** L, double** U, int* p, double* pb, double* x, double* y, int size, bool is_sparse){
+	FILE* fp_dc = fopen("dc_op", "w+");
+	htentry_t* node;
+	if(!is_sparse){
+		if(is_spd){
+			printf("Solving with Cholesky decomposition!\n");
+			if(!chol_dec(dc_mna.A, L, U, size)){
+				printf("Warning!: The mna matrix is not SPD\n");
+				lu_dec(dc_mna.A, L, U, p, size);		
+			}
+		}
+		else{
+			printf("Solving with LU decomposition!\n");
+			lu_dec(dc_mna.A, L, U, p, size);			
+		}
+		
+		// solving for dc op
+		for(int i = 0; i < size; i++){
+			pb[i] = dc_mna.b[p[i]];
+		}
+		solve_ld(L, pb, size, y);
+		solve_ud(U, y, size, x);
+		
+		//copying initial solution to x0
+		for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+			dc_mna.x0[i] = x[i];
+		}
+		
+		for(int i = 0; i < ht->capacity; i++){
+			node = ht->table[i];
+			if(node)
+				fprintf(fp_dc, "%s  %.12f\n", node->string, x[node->id]);
+		}
+		for(int i = dc_mna.m1; i < dc_mna.m1 + dc_mna.m2; i++){
+			fprintf(fp_dc, "i%d  %.12f\n", i ,x[i]);
+		}
+	}
+	else{
+		double* b_sp = (double*)malloc(sizeof(double)*size);
+		for(int i = 0; i < size; i++){
+			b_sp[i] = dc_mna.b[i];
+		}
+		if(is_spd){
+			printf("Solving with sparse Cholesky decomposition!\n");
+			sparse_chol_dec(dc_mna);
+			sparse_chol_solve(b_sp,y,size);
+		}
+		else{
+			printf("Solving with sparse LU decomposition!\n");
+			sparse_lu_dec(dc_mna);
+			sparse_lu_solve(b_sp,y,size);
+		}
+		
+		//copying initial solution to x0
+		for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+			dc_mna.x0[i] = b_sp[i];
+		}
+		
+		for(int i = 0; i < ht->capacity; i++){
+			node = ht->table[i];
+			if(node)
+				fprintf(fp_dc, "%s  %.12f\n", node->string, b_sp[node->id]);
+		}
+		for(int i = dc_mna.m1; i < dc_mna.m1 + dc_mna.m2; i++){
+			fprintf(fp_dc, "i%d  %.12f\n", i ,b_sp[i]);
+		}
+		free(b_sp);
+	}
+	fclose(fp_dc);
+	
+}
+
+void solve_iter_dcop(ht_t* ht, dc_mna_t dc_mna, bool is_spd, double* x, double itol, int size, bool is_sparse){
+	htentry_t* node;
+	
+	if(!is_sparse){
+	
+		if(is_spd){
+			printf("Solving with Conjugate Gradients (itol=%.9f) algorithm!\n", itol);
+			cg_calloc(size);
+			cg(dc_mna.A,x,dc_mna.b,itol, size);
+			free_cg();
+		}
+		else{
+			printf("Solving with Bi-Conjugate Gradients (itol=%.9f) algorithm!\n", itol);
+			bicg_calloc(size);
+			bicg(dc_mna.A,x,dc_mna.b,itol, size);
+			free_bicg();
+		
+		}
+	}
+	else{
+		if(is_spd){
+			printf("Solving with sparse Conjugate Gradients (itol=%.9f) algorithm!\n", itol);
+			cg_calloc(size);
+			sparse_cg(dc_mna.C,x,dc_mna.b,itol);
+			free_cg();
+		}
+		else{
+			printf("Solving with sparse Bi-Conjugate Gradients (itol=%.9f) algorithm!\n", itol);
+			bicg_calloc(size);
+			sparse_bicg(dc_mna.C,x,dc_mna.b,itol);	
+            free_bicg();
+		}
+	}
+	FILE* fp_dc = fopen("dc_op", "w+");
+    
+	//copying initial solution to x0
+	for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+		dc_mna.x0[i] = x[i];
+	}
+	
+	for(int i = 0; i < ht->capacity; i++){
+		node = ht->table[i];
+		if(node)
+			fprintf(fp_dc, "%s  %.12f\n", node->string, x[node->id]);
+	}
+	for(int i = dc_mna.m1; i < dc_mna.m1 + dc_mna.m2; i++){
+		fprintf(fp_dc, "i%d  %.12f\n", i ,x[i]);
+	}
+	fclose(fp_dc);
+}
+
+void plot_dcsweep(char* input_var, char* node_name, int dcsweep_counter){
+	char filename[MAX_LEN_SP], temp_var[MAX_LEN], temp_name[MAX_LEN];
+	int i;
+	
+	sprintf(filename, "dcsweep%d_%s_%s", dcsweep_counter, input_var, node_name);
+	
+	FILE *gnuplot = popen("gnuplot -persist", "w");
+	
+	for(i = 0; i < strlen(input_var); i++){
+		if(input_var[i] == '_')
+			temp_var[i] = '.';
+		else
+			temp_var[i] = input_var[i];	
+	}
+	temp_var[i] = '\0';
+	
+	for(i = 0; i < strlen(node_name); i++){
+		if(node_name[i] == '_')
+			temp_name[i] = '.';
+		else
+			temp_name[i] = node_name[i];	
+	}
+	temp_name[i] = '\0';
+	
+    if (!gnuplot) {
+        perror("popen");
+        exit(EXIT_FAILURE);
+    }
+    fprintf(gnuplot, "plot \"%s\" t 'dcsweep%d:%s:%s' w lp\n", filename, dcsweep_counter, temp_var, temp_name);
+    fflush(gnuplot);
+
+    pclose(gnuplot);
+}
+
+void plot_tran(char* node_name, int tran_counter){
+	char filename[MAX_LEN_SP], temp_name[MAX_LEN];
+	int i;
+	
+	sprintf(filename, "tran%d_%s", tran_counter, node_name);
+	
+	FILE *gnuplot = popen("gnuplot -persist", "w");
+	
+	for(i = 0; i < strlen(node_name); i++){
+		if(node_name[i] == '_')
+			temp_name[i] = '.';
+		else
+			temp_name[i] = node_name[i];	
+	}
+	temp_name[i] = '\0';
+	
+    if (!gnuplot) {
+        perror("popen");
+        exit(EXIT_FAILURE);
+    }
+    fprintf(gnuplot, "plot \"%s\" t 'tran%d:%s' w lp\n", filename, tran_counter, temp_name);
+    fflush(gnuplot);
+
+    pclose(gnuplot);
+}
+
+void solve_direct_dcsweep(dc_mna_t dc_mna, ht_t* ht, list_t list, FILE* out_fp[], int num_prints, int nodes_print[], double** L, double** U, int* p, double* pb, double* bdc, double* x, double* y, char* input_var, double start_val, double end_val, double inc, bool is_sparse, bool is_spd){
+	int pos_node, neg_node;
+	double *b_sp = (double*)malloc(sizeof(double)*(get_ht_size(ht) + dc_mna.m2));
+	node_t* el_ptr;
+	
+	for(int i = 0; i < get_ht_size(ht) + dc_mna.m2; i++){
+		bdc[i] = dc_mna.b[i];
+	}
+					
+	// current source in dc sweep
+	if(input_var[0] == 'i'){
+		el_ptr = return_element(list, &input_var[1], 'i');
+		pos_node = lookup(ht, el_ptr->node1);
+		neg_node = lookup(ht, el_ptr->node2);
+						
+		// starting values for b
+		if(pos_node >= 0)
+			bdc[pos_node] = bdc[pos_node] + el_ptr->val - start_val;
+						
+		if(neg_node >= 0)
+			bdc[neg_node] = bdc[neg_node] - el_ptr->val + start_val; 
+						
+		for(double val = start_val; val <= end_val; val += inc){
+			if(!is_sparse){
+				//init Pb
+				for(int i = 0; i < get_ht_size(ht) + dc_mna.m2; i++){
+					pb[i] = bdc[p[i]];
+				}
+				//print_vector(bdc, get_ht_size(ht) + m2);
+				//solve Upper and Lower Triangular
+				solve_ld(L, pb, get_ht_size(ht) + dc_mna.m2, y);
+				solve_ud(U, y, get_ht_size(ht) + dc_mna.m2, x);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+			}
+			else{
+				for(int i = 0; i < get_ht_size(ht) + dc_mna.m2; i++){
+					b_sp[i] = bdc[i];
+				}
+				if(!is_spd)
+					sparse_lu_solve(b_sp, y, get_ht_size(ht) + dc_mna.m2);
+				else
+					sparse_chol_solve( b_sp, y, get_ht_size(ht) + dc_mna.m2);
+					
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, b_sp[nodes_print[i]]);
+				}
+			}
+			//print_vector(x, get_ht_size(ht) + m2);
+			//increment for bdc
+			if(pos_node >= 0)
+				bdc[pos_node] -= inc;
+								
+			if(neg_node >= 0)	
+				bdc[neg_node] += inc;
+		}
+	}
+	else{ // voltage source	
+		el_ptr = return_element(list, &input_var[1], 'v');
+		pos_node = k_value(list, el_ptr->name) + get_ht_size(ht);
+		//printf("k_value = %d\n", k_value(list, el_ptr->name) );
+		bdc[pos_node] = bdc[pos_node] - el_ptr->val + start_val;
+						
+		for(double val = start_val; val <= end_val; val += inc){
+			if(!is_sparse){
+				//init Pb
+				for(int i = 0; i < get_ht_size(ht) + dc_mna.m2; i++){
+					pb[i] = bdc[p[i]];
+				}
+				//print_vector(bdc, get_ht_size(ht) + m2);
+				//solve Upper and Lower Triangular
+				solve_ld(L, pb, get_ht_size(ht) + dc_mna.m2, y);
+				solve_ud(U, y, get_ht_size(ht) + dc_mna.m2, x);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+			}
+			else{
+				for(int i = 0; i < get_ht_size(ht) + dc_mna.m2; i++){
+					b_sp[i] = bdc[i];
+				}
+				if(!is_spd)
+					sparse_lu_solve(b_sp, y, get_ht_size(ht) + dc_mna.m2);
+				else
+					sparse_chol_solve(b_sp, y, get_ht_size(ht) + dc_mna.m2);
+					
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, b_sp[nodes_print[i]]);
+				}
+			}
+			//print_vector(x, get_ht_size(ht) + m2);
+			//increment for bdc
+			bdc[pos_node] += inc;
+		}
+						
+	}
+	if(is_sparse)
+		free(b_sp);
+	//closing out files
+	for(int i = 0; i < num_prints; i++){
+		fclose(out_fp[i]);
+	}	
+}
+
+
+void solve_iter_dcsweep(dc_mna_t dc_mna, ht_t* ht, list_t list, FILE* out_fp[], int num_prints, int nodes_print[], double itol, double* bdc, double* x, char* input_var, double start_val, double end_val, double inc, bool is_sparse){
+	int pos_node, neg_node;
+	node_t* el_ptr;
+	
+	for(int i = 0; i < get_ht_size(ht) + dc_mna.m2; i++){
+		bdc[i] = dc_mna.b[i];
+		x[i] = 0;
+	}
+					
+	// current source in dc sweep
+	if(input_var[0] == 'i'){
+		el_ptr = return_element(list, &input_var[1], 'i');
+		pos_node = lookup(ht, el_ptr->node1);
+		neg_node = lookup(ht, el_ptr->node2);
+						
+		// starting values for b
+		if(pos_node >= 0)
+			bdc[pos_node] = bdc[pos_node] + el_ptr->val - start_val;
+						
+		if(neg_node >= 0)
+			bdc[neg_node] = bdc[neg_node] - el_ptr->val + start_val; 
+		if(!is_sparse){
+		
+		    bicg_calloc(get_ht_size(ht) + dc_mna.m2);
+		
+			for(double val = start_val; val <= end_val; val += inc){
+				
+				bicg(dc_mna.A,x,bdc,itol, get_ht_size(ht) + dc_mna.m2);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+								
+				//print_vector(x, get_ht_size(ht) + m2);
+				//increment for bdc
+				if(pos_node >= 0)
+					bdc[pos_node] -= inc;
+									
+				if(neg_node >= 0)	
+					bdc[neg_node] += inc;
+			}
+			
+			free_bicg();
+		}
+		else{
+		
+		    bicg_calloc(get_ht_size(ht) + dc_mna.m2);
+		        
+			for(double val = start_val; val <= end_val; val += inc){
+				
+				sparse_bicg(dc_mna.C,x,bdc,itol);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+								
+				//print_vector(x, get_ht_size(ht) + m2);
+				//increment for bdc
+				if(pos_node >= 0)
+					bdc[pos_node] -= inc;
+									
+				if(neg_node >= 0)	
+					bdc[neg_node] += inc;
+			}
+			
+			free_bicg();
+		}
+	}
+	else{ // voltage source	
+		el_ptr = return_element(list, &input_var[1], 'v');
+		pos_node = k_value(list, el_ptr->name) + get_ht_size(ht);
+		//printf("k_value = %d\n", k_value(list, el_ptr->name) );
+		bdc[pos_node] = bdc[pos_node] - el_ptr->val + start_val;
+		
+		if(!is_sparse){	
+		
+		    bicg_calloc(get_ht_size(ht) + dc_mna.m2);
+		
+			for(double val = start_val; val <= end_val; val += inc){
+				
+				bicg(dc_mna.A,x,bdc,itol, get_ht_size(ht) + dc_mna.m2);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+								
+				//print_vector(x, get_ht_size(ht) + m2);
+				//increment for bdc
+				bdc[pos_node] += inc;
+			}
+			
+			free_bicg();
+		}
+		else{
+		
+		    bicg_calloc(get_ht_size(ht) + dc_mna.m2);
+		        
+			for(double val = start_val; val <= end_val; val += inc){
+				
+				sparse_bicg(dc_mna.C,x,bdc,itol);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+								
+				//print_vector(x, get_ht_size(ht) + m2);
+				//increment for bdc
+				bdc[pos_node] += inc;
+			}
+			
+			free_bicg();
+		}
+						
+	}
+					
+	//closing out files
+	for(int i = 0; i < num_prints; i++){
+		fclose(out_fp[i]);
+	}
+}
+
+void solve_iter_dcsweep_spd(dc_mna_t dc_mna, ht_t* ht, list_t list, FILE* out_fp[], int num_prints, int nodes_print[], double itol, double* bdc, double* x, char* input_var, double start_val, double end_val, double inc, bool is_sparse){
+	int pos_node, neg_node;
+	node_t* el_ptr;
+	
+	for(int i = 0; i < get_ht_size(ht) + dc_mna.m2; i++){
+		bdc[i] = dc_mna.b[i];
+		x[i] = 0;
+	}
+					
+	// current source in dc sweep
+	if(input_var[0] == 'i'){
+		el_ptr = return_element(list, &input_var[1], 'i');
+		pos_node = lookup(ht, el_ptr->node1);
+		neg_node = lookup(ht, el_ptr->node2);
+						
+		// starting values for b
+		if(pos_node >= 0)
+			bdc[pos_node] = bdc[pos_node] + el_ptr->val - start_val;
+						
+		if(neg_node >= 0)
+			bdc[neg_node] = bdc[neg_node] - el_ptr->val + start_val; 
+		
+		if(!is_sparse){	
+		    cg_calloc(get_ht_size(ht) + dc_mna.m2);
+		        
+			for(double val = start_val; val <= end_val; val += inc){
+				
+				cg(dc_mna.A,x,bdc,itol, get_ht_size(ht) + dc_mna.m2);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+								
+				//print_vector(x, get_ht_size(ht) + m2);
+				//increment for bdc
+				if(pos_node >= 0)
+					bdc[pos_node] -= inc;
+									
+				if(neg_node >= 0)	
+					bdc[neg_node] += inc;
+			}
+			
+			free_cg();
+		}
+		else{
+		
+		    cg_calloc(get_ht_size(ht) + dc_mna.m2);
+		        
+			for(double val = start_val; val <= end_val; val += inc){
+				sparse_cg(dc_mna.C,x,bdc,itol);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+								
+				//print_vector(x, get_ht_size(ht) + m2);
+				//increment for bdc
+				if(pos_node >= 0)
+					bdc[pos_node] -= inc;
+									
+				if(neg_node >= 0)	
+					bdc[neg_node] += inc;
+			}
+			
+			free_cg();
+		}
+	}
+	else{ // voltage source	
+		el_ptr = return_element(list, &input_var[1], 'v');
+		pos_node = k_value(list, el_ptr->name) + get_ht_size(ht);
+		//printf("k_value = %d\n", k_value(list, el_ptr->name) );
+		bdc[pos_node] = bdc[pos_node] - el_ptr->val + start_val;
+		
+		if(!is_sparse){	
+		
+		    cg_calloc(get_ht_size(ht) + dc_mna.m2);
+		        
+			for(double val = start_val; val <= end_val; val += inc){
+				
+				cg(dc_mna.A,x,bdc,itol, get_ht_size(ht) + dc_mna.m2);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+								
+				//print_vector(x, get_ht_size(ht) + m2);
+				//increment for bdc
+				bdc[pos_node] += inc;
+			}
+			
+			free_cg();
+		}
+		else{
+		
+		    cg_calloc(get_ht_size(ht) + dc_mna.m2);
+		        
+			for(double val = start_val; val <= end_val; val += inc){
+				sparse_cg(dc_mna.C,x,bdc,itol);
+								
+				//print in file
+				for(int i = 0; i < num_prints; i++){
+					fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", val, x[nodes_print[i]]);
+				}
+								
+				//print_vector(x, get_ht_size(ht) + m2);
+				//increment for bdc
+				bdc[pos_node] += inc;
+			}
+			
+			free_cg();
+		}					
+	}				
+	//closing out files
+	for(int i = 0; i < num_prints; i++){
+		fclose(out_fp[i]);
+	}
+}
+
+
+void solve_direct_tran(dc_mna_t dc_mna, ht_t* ht, list_t list, tran_list_t* tran_list, FILE* out_fp[], int num_prints, int nodes_print[], double end_val, double inc, bool is_sparse, bool is_spd, char method){
+	double *x_cur = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	double *x_prev = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	double *b_tran = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	double t_cur;
+	double* e_cur = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	double* e_prev = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	double* y = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	int pos_node, neg_node;
+	tran_node_t* curr;
+	
+	//initializes x_k-1 to x0 and e_prev to e_cur to b
+	for(int i =0; i < dc_mna.m1 + dc_mna.m2; i++){
+		x_prev[i] = dc_mna.x0[i];
+		e_cur[i] = dc_mna.b[i];
+	}
+	
+	if(is_sparse){
+		cs* A_tran;
+		cs* B_tran;
+		if(method =='t'){
+			A_tran = cs_add(dc_mna.C,dc_mna.D,1,2/inc);
+			B_tran = cs_add(dc_mna.C,dc_mna.D,-1,2/inc);
+			if(is_spd){
+				sparse_tran_chol_dec(A_tran);
+				
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_prev[i] = e_cur[i];
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i] + e_prev[i];
+					}
+					
+					if(!cs_gaxpy(B_tran,x_prev, b_tran)){
+						printf("Error using gaxpy\n");
+						exit(-1);
+					}
+					
+					sparse_chol_solve(b_tran,y,dc_mna.m1 + dc_mna.m2);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, b_tran[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = b_tran[i];
+					}
+				}		
+			}
+			else{
+				sparse_tran_lu_dec(A_tran);
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_prev[i] = e_cur[i];
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					//making e_tk
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i] + e_prev[i];
+					}
+					
+					if(!cs_gaxpy(B_tran,x_prev, b_tran)){
+						printf("Error using gaxpy\n");
+						exit(-1);
+					}
+					
+					sparse_lu_solve(b_tran,y,dc_mna.m1 + dc_mna.m2);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, b_tran[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = b_tran[i];
+					}
+				}
+			}
+		}
+		else{
+		    A_tran = cs_add(dc_mna.C,dc_mna.D,1,1/inc);
+		    B_tran = cs_add(dc_mna.C,dc_mna.D,0,1/inc);
+			if(is_spd){
+				sparse_tran_chol_dec(A_tran);
+				
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i];
+					}
+					
+					if(!cs_gaxpy(B_tran,x_prev, b_tran)){
+						printf("Error using gaxpy\n");
+						exit(-1);
+					}
+					
+					sparse_chol_solve(b_tran,y,dc_mna.m1 + dc_mna.m2);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, b_tran[nodes_print[i]]);
+					}
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = b_tran[i];
+					}
+				}		
+			}
+			else{
+				sparse_tran_lu_dec(A_tran);
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i];
+					}
+					
+					if(!cs_gaxpy(B_tran,x_prev, b_tran)){
+						printf("Error using gaxpy\n");
+						exit(-1);
+					}
+					
+					sparse_lu_solve(b_tran,y,dc_mna.m1 + dc_mna.m2);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, b_tran[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = b_tran[i];
+					}
+				}
+			}
+		}
+		cs_spfree(B_tran);
+	}
+	else{
+		double** A_tran;
+		double** B_tran;
+		double** L_tran = (double**)malloc(sizeof(double*)*(dc_mna.m1+dc_mna.m2));
+		double** U_tran = (double**)malloc(sizeof(double*)*(dc_mna.m1+dc_mna.m2));
+		int* p_tran = (int*)malloc(sizeof(int)*(dc_mna.m1+dc_mna.m2));
+		double* pb = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+		for(int i = 0; i < (dc_mna.m1+dc_mna.m2); i++){
+			L_tran[i] = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+			U_tran[i] = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+		}
+		
+		if(method == 't'){
+			A_tran = add(dc_mna.A, dc_mna.B, 1, 2/inc, (dc_mna.m1+dc_mna.m2));
+			B_tran = add(dc_mna.A, dc_mna.B, -1, 2/inc, (dc_mna.m1+dc_mna.m2));
+			if(is_spd){
+				chol_dec(A_tran, L_tran, U_tran, (dc_mna.m1+dc_mna.m2));
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_prev[i] = e_cur[i];
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i] + e_prev[i];
+					}
+					
+					gaxpy(B_tran,x_prev, b_tran, dc_mna.m1 + dc_mna.m2 );
+					
+					//pb = b_tran for chol
+					solve_ld(L_tran, b_tran, get_ht_size(ht) + dc_mna.m2, y);
+					solve_ud(U_tran, y, get_ht_size(ht) + dc_mna.m2, x_cur);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+				
+			}
+			else{
+				lu_dec(A_tran,L_tran,U_tran,p_tran,(dc_mna.m1+dc_mna.m2));
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_prev[i] = e_cur[i];
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i] + e_prev[i];
+					}
+					
+					gaxpy(B_tran,x_prev, b_tran, dc_mna.m1 + dc_mna.m2 );
+					
+					// line permutation for right hand side
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						pb[i] = b_tran[p_tran[i]];
+					}
+					solve_ld(L_tran, pb, get_ht_size(ht) + dc_mna.m2, y);
+					solve_ud(U_tran, y, get_ht_size(ht) + dc_mna.m2, x_cur);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+			}
+		}
+		else{
+			A_tran = add(dc_mna.A, dc_mna.B, 1, 1/inc, (dc_mna.m1+dc_mna.m2));
+			B_tran = add(dc_mna.A, dc_mna.B, 0, 1/inc, (dc_mna.m1+dc_mna.m2));
+			if(is_spd){
+				chol_dec(A_tran, L_tran, U_tran, (dc_mna.m1+dc_mna.m2));
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i];
+					}
+					
+					gaxpy(B_tran,x_prev, b_tran, dc_mna.m1 + dc_mna.m2 );
+					
+					//pb = b_tran for chol
+					solve_ld(L_tran, b_tran, get_ht_size(ht) + dc_mna.m2, y);
+					solve_ud(U_tran, y, get_ht_size(ht) + dc_mna.m2, x_cur);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+				
+			}
+			else{
+				lu_dec(A_tran,L_tran,U_tran,p_tran,(dc_mna.m1+dc_mna.m2));
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i];
+					}
+					
+					gaxpy(B_tran,x_prev, b_tran, dc_mna.m1 + dc_mna.m2 );
+					
+					// line permutation for right hand side
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						pb[i] = b_tran[p_tran[i]];
+					}
+					solve_ld(L_tran, pb, get_ht_size(ht) + dc_mna.m2, y);
+					solve_ud(U_tran, y, get_ht_size(ht) + dc_mna.m2, x_cur);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+			}	
+		}
+		
+		for(int i = 0; i <(dc_mna.m1+dc_mna.m2); i++){
+			free(A_tran[i]);
+			free(B_tran[i]);
+			free(L_tran[i]);
+			free(U_tran[i]);
+		}
+		free(A_tran);
+		free(B_tran);
+		free(L_tran);
+		free(U_tran);
+		free(p_tran);
+	}
+	
+	free(y);
+	free(x_cur);
+	free(x_prev);
+	free(b_tran);
+	free(e_cur);
+	free(e_prev);
+	
+	//closing out files
+	for(int i = 0; i < num_prints; i++){
+		fclose(out_fp[i]);
+	}
+}
+
+
+void solve_iter_tran(dc_mna_t dc_mna, ht_t* ht, list_t list, tran_list_t* tran_list, FILE* out_fp[], int num_prints, int nodes_print[], double end_val, double inc, bool is_sparse, bool is_spd, char method, int itol){
+	double *x_cur = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	double *x_prev = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	double *b_tran = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	double t_cur;
+	double* e_cur = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	double* e_prev = (double*)malloc(sizeof(double)*(dc_mna.m1+dc_mna.m2));
+	int pos_node, neg_node;
+	tran_node_t* curr;
+	
+	//initializes x_k-1 to x0 and e_prev to e_cur to b
+	for(int i =0; i < dc_mna.m1 + dc_mna.m2; i++){
+		x_prev[i] = dc_mna.x0[i];
+		x_cur[i] = 0;
+		e_cur[i] = dc_mna.b[i];
+	}
+	
+	if(is_sparse){
+		cs* A_tran;
+		cs* B_tran;
+		if(method =='t'){
+			A_tran = cs_add(dc_mna.C,dc_mna.D,1,2/inc);
+			B_tran = cs_add(dc_mna.C,dc_mna.D,-1,2/inc);
+			if(is_spd){	
+			        
+			    cg_calloc(dc_mna.m1 + dc_mna.m2);
+			
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_prev[i] = e_cur[i];
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i] + e_prev[i];
+					}
+					
+					if(!cs_gaxpy(B_tran,x_prev, b_tran)){
+						printf("Error using gaxpy\n");
+						exit(-1);
+					}
+					
+					sparse_cg(A_tran, x_cur, b_tran, itol);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+				
+				free_cg();
+			}
+			else{
+			        
+			    bicg_calloc(dc_mna.m1 + dc_mna.m2);
+			        
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_prev[i] = e_cur[i];
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					//making e_tk
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i] + e_prev[i];
+					}
+					
+					if(!cs_gaxpy(B_tran,x_prev, b_tran)){
+						printf("Error using gaxpy\n");
+						exit(-1);
+					}
+					
+					sparse_bicg(A_tran, x_cur, b_tran, itol);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+				
+				free_bicg();
+			}
+		}
+		else{
+		    A_tran = cs_add(dc_mna.C,dc_mna.D,1,1/inc);
+		    B_tran = cs_add(dc_mna.C,dc_mna.D,0,1/inc);
+			if(is_spd){
+			       
+			    cg_calloc(dc_mna.m1 + dc_mna.m2);
+			        
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i];
+					}
+					
+					if(!cs_gaxpy(B_tran,x_prev, b_tran)){
+						printf("Error using gaxpy\n");
+						exit(-1);
+					}
+					
+					sparse_cg(A_tran, x_cur, b_tran, itol);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+				
+				free_cg();
+			}
+			else{
+			        
+			    bicg_calloc(dc_mna.m1 + dc_mna.m2);
+			
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i];
+					}
+					
+					if(!cs_gaxpy(B_tran,x_prev, b_tran)){
+						printf("Error using gaxpy\n");
+						exit(-1);
+					}
+					
+					sparse_bicg(A_tran, x_cur, b_tran, itol);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, b_tran[nodes_print[i]]);
+					}
+				}
+				
+				free_bicg();
+			}
+		}
+		cs_spfree(B_tran);
+	}
+	else{
+		double** A_tran;
+		double** B_tran;
+		
+		if(method == 't'){
+			A_tran = add(dc_mna.A, dc_mna.B, 1, 2/inc, (dc_mna.m1+dc_mna.m2));
+			B_tran = add(dc_mna.A, dc_mna.B, -1, 2/inc, (dc_mna.m1+dc_mna.m2));
+			if(is_spd){
+			
+			    cg_calloc(dc_mna.m1+dc_mna.m2);
+			
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_prev[i] = e_cur[i];
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i] + e_prev[i];
+					}
+					
+					gaxpy(B_tran,x_prev, b_tran, dc_mna.m1 + dc_mna.m2 );
+					
+					cg(A_tran, x_cur, b_tran, itol, dc_mna.m1 + dc_mna.m2);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+				
+				free_cg();
+				
+			}
+			else{
+			
+			    bicg_calloc(dc_mna.m1 + dc_mna.m2);			
+			
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_prev[i] = e_cur[i];
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i] + e_prev[i];
+					}
+					
+					gaxpy(B_tran,x_prev, b_tran, dc_mna.m1 + dc_mna.m2 );
+					
+					bicg(A_tran, x_cur, b_tran, itol, dc_mna.m1 + dc_mna.m2);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+				
+				free_bicg();
+			}
+		}
+		else{
+			A_tran = add(dc_mna.A, dc_mna.B, 1, 1/inc, (dc_mna.m1+dc_mna.m2));
+			B_tran = add(dc_mna.A, dc_mna.B, 0, 1/inc, (dc_mna.m1+dc_mna.m2));
+			if(is_spd){
+			
+			    cg_calloc(dc_mna.m1+dc_mna.m2);
+			
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i];
+					}
+					
+					gaxpy(B_tran,x_prev, b_tran, dc_mna.m1 + dc_mna.m2 );
+					
+					cg(A_tran, x_cur, b_tran, itol, dc_mna.m1 + dc_mna.m2);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+				
+				free_cg();
+				
+			}
+			else{
+			
+			    bicg_calloc(dc_mna.m1 + dc_mna.m2);
+			
+				for(t_cur = inc; t_cur <= end_val; t_cur += inc){
+					//making new b_tran
+					for(int i = 0; i<dc_mna.m1 + dc_mna.m2; i++){
+						e_cur[i] = dc_mna.b[i]; 
+					}
+					curr = tran_list->head;
+					while(curr != NULL){
+						//if curr tran element is i
+						if(curr->tran_node->el == 'i'){
+							pos_node = lookup(ht, curr->tran_node->node1);
+							neg_node = lookup(ht, curr->tran_node->node2);
+							if(pos_node >= 0){
+								e_cur[pos_node] = e_cur[pos_node] + curr->tran_node->val - (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+							if(neg_node >= 0){
+								e_cur[neg_node] = e_cur[neg_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+							}
+								
+						}
+						//if curr tran element is v
+						else{
+							pos_node = k_value(list, curr->tran_node->name) + get_ht_size(ht);
+							e_cur[pos_node] = e_cur[pos_node] - curr->tran_node->val + (*curr->tran_node->tran_spec->fun)(curr->tran_node->tran_spec->args, curr->tran_node->tran_spec->num_args, t_cur);
+						}
+						
+						curr = curr->next;
+					}
+					// we will store e_cur and e_prev to b_tran
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						b_tran[i] = e_cur[i];
+					}
+					
+					gaxpy(B_tran,x_prev, b_tran, dc_mna.m1 + dc_mna.m2 );
+					
+					bicg(A_tran, x_cur, b_tran, itol, dc_mna.m1 + dc_mna.m2);
+					
+					//print in file
+					for(int i = 0; i < num_prints; i++){
+						fprintf(out_fp[i], "%16.9f \t\t %16.9f\n", t_cur, x_cur[nodes_print[i]]);
+					}
+					
+					//updating x_prev
+					for(int i = 0; i < dc_mna.m1 + dc_mna.m2; i++){
+						x_prev[i] = x_cur[i];
+					}
+				}
+				
+				free_bicg();
+			}	
+		}	
+	}
+	
+	free(x_cur);
+	free(x_prev);
+	free(b_tran);
+	free(e_cur);
+	free(e_prev);
+	
+	//closing out files
+	for(int i = 0; i < num_prints; i++){
+		fclose(out_fp[i]);
+	}
+}
 
 int main(int argc, char *argv[]) {
-	FILE * fp;
+	FILE * fp, *out_fp[MAX_LEN];
 	char line[IMPORT_LINE_SIZE], element, name[MAX_LEN], node1[MAX_LEN], node2[MAX_LEN], w_str[MAX_LEN], l_str[MAX_LEN];
-	char node3[MAX_LEN], node4[MAX_LEN], val_str[MAX_LEN], model_name[MAX_LEN], area_str[MAX_LEN];
-	char *token = NULL;
-	int i, m2 = 0;
-	double val, area, w, l;
-	ht_t* ht = init_ht(5);	
+	char node3[MAX_LEN], node4[MAX_LEN], val_str[MAX_LEN], model_name[MAX_LEN], area_str[MAX_LEN], node_names[MAX_LEN][MAX_LEN];
+	char *token = NULL, method ='t', analysis='n';
+	char input_var[MAX_LEN], str1[MAX_LEN], str2[MAX_LEN];
+	char node_name[MAX_LEN], out_name[MAX_LEN_SP];
+	int i, j, m2 = 0, dcsweep_counter = 0, tran_counter = 0, num_prints=0, nodes_print[MAX_LEN];
+	int num_args;
+	double val, area, w, l, start_val, end_val, inc, itol = 1e-3;
+	ht_t* ht = init_ht(INITIAL_SIZE);	
 	list_t list;
+	tran_list_t tran_list;
 	dc_mna_t dc_mna;
+	bool is_spd = false, is_iter=false, is_sparse=false;
+	double *x, *y, *pb, *bdc, args[MAX_LEN];
+	double **L, **U;
+	int *p;
+	tran_spec_t* tran_spec;
 	
-	list_init(&list);
-	
+	list_init(&list, &tran_list);
 
 	if(argc == 2){
 		fp = fopen(argv[1], "r");
 	}
 	else{
-		printf("Too few arguments!\n");
+		printf("Invalid number of arguments!\n");
 		return(-1);
 	}
 	
@@ -172,14 +2091,15 @@ int main(int argc, char *argv[]) {
 		return(-2);
 	}
 	
+	printf("Parsing netlist...\n");
 	while(1) {
-		area = w = l = 0;
-		
-		
+		num_args = area = w = l = 0;
+		tran_spec = NULL;
+	
 		if(fgets(line, IMPORT_LINE_SIZE, fp) == NULL) { //read file line by line
 			break;
 		}
-		printf("line is: %s", line);
+		//printf("line is: %s", line);
 		
 		//convert string to lowercase characters
 		i = 0;
@@ -202,8 +2122,10 @@ int main(int argc, char *argv[]) {
 			continue;
 		}
 		else if(line[0] == 'v') {
+			line[strlen(line) - 1] = '\0';
+			
 			element = 'v';
-
+			
 			token = strtok(&line[1], " ");
 			strcpy(name, token);
 			token = strtok(NULL, " ");
@@ -213,6 +2135,43 @@ int main(int argc, char *argv[]) {
 			token = strtok(NULL, " ");
 			strcpy(val_str, token);
 			m2++;
+			
+			//
+			
+			token = strtok(NULL, "(");
+			if(token != NULL){
+				// if there is transient spec
+				// we will use node3 for fun name
+				//printf("Element v%s has transient %s\n", name, token);
+				strcpy(node3, token);
+				
+				//if is not pwl
+				if(strcmp(token,"pwl")){
+					while( (token = strtok(NULL, " ") ) ){
+						args[num_args] = atof(token);
+						//printf("Token: %f\n", args[num_args]);
+						num_args++;
+					}
+				}
+				else{	
+					token = strtok(NULL, ")");
+					split_string(token, l_str, w_str, ' ');
+					args[num_args] = atof(l_str);
+					args[num_args + 1] = atof(w_str);
+					//printf("Token1: %f, Token2: %f\n", args[num_args], args[num_args+1]);
+					num_args +=2;
+				
+					while((token = strtok(NULL, ")"))){
+						split_string(&token[1], l_str, w_str, ' ');
+						args[num_args] = atof(l_str);
+						args[num_args + 1] = atof(w_str);
+						//printf("Token1: %f, Token2: %f\n", args[num_args], args[num_args+1]);
+						num_args +=2;
+					}
+				}
+				tran_spec = tran_spec_create(node3, args, num_args);
+				//printf("Value: %f\n", (*tran_spec->fun)(tran_spec->args, tran_spec->num_args, 46.5));
+			}
 		}
 		else if(line[0] == 'r') {
 			element = 'r';
@@ -237,6 +2196,41 @@ int main(int argc, char *argv[]) {
 			strcpy(node2, token);
 			token = strtok(NULL, " ");
 			strcpy(val_str, token);
+			
+			token = strtok(NULL, "(");
+			if(token != NULL){
+				// if there is transient spec
+				// we will use node3 for fun name
+				//printf("Element v%s has transient %s\n", name, token);
+				strcpy(node3, token);
+				
+				//if is not pwl
+				if(strcmp(token,"pwl")){
+					while( (token = strtok(NULL, " ") ) ){
+						args[num_args] = atof(token);
+						//printf("Token: %f\n", args[num_args]);
+						num_args++;
+					}
+				}
+				else{	
+					token = strtok(NULL, ")");
+					split_string(token, l_str, w_str, ' ');
+					args[num_args] = atof(l_str);
+					args[num_args + 1] = atof(w_str);
+					//printf("Token1: %f, Token2: %f\n", args[num_args], args[num_args+1]);
+					num_args +=2;
+				
+					while((token = strtok(NULL, ")"))){
+						split_string(&token[1], l_str, w_str, ' ');
+						args[num_args] = atof(l_str);
+						args[num_args + 1] = atof(w_str);
+						//printf("Token1: %f, Token2: %f\n", args[num_args], args[num_args+1]);
+						num_args +=2;
+					}
+				}
+				tran_spec = tran_spec_create(node3, args, num_args);
+				//printf("Value: %f\n", (*tran_spec->fun)(tran_spec->args, tran_spec->num_args, 46.5));
+			}
 		}
 		else if(line[0] == 'c') {
 			element = 'c';
@@ -336,8 +2330,69 @@ int main(int argc, char *argv[]) {
 				area = atof(area_str);
 			}
 		}
+		else if(line[0] == '.'){
+			line[strlen(line)-1] = '\0';
+			token = strtok(&line[1], " ");
+			if(!strcmp("options" , token)) {
+				while( (token = strtok(NULL, " ") ) ){	
+					//printf("Token:%s\n", token);
+					if(!strcmp("spd" , token)){
+						is_spd = true;
+					}
+					else if(!strcmp("iter" , token)){
+						is_iter = true;
+					}
+					else if(!strcmp("sparse" , token)){
+						is_sparse = true;
+					}
+					else{ //itol or method
+						split_string(token, str1, str2, '=');
+						
+						//itol for iter method
+						if(!strcmp("itol" , str1)){
+							itol = atof(str2);
+						}
+						else{ //method for trans
+							if(!strcmp("tr" , str2)){
+								method = 't';
+							}
+							else if(!strcmp("be" ,str2)){
+								method = 'b';
+							}	
+						}
+					}
+				}
+			}
+			else if(!strcmp("dc" , token)){ //dc sweep
+				dcsweep_counter++;
+				token = strtok(NULL, " ");
+				strcpy(input_var, token);
+				token = strtok(NULL, " ");
+				start_val = atof(token);
+				token = strtok(NULL, " ");
+				end_val =  atof(token);
+				token = strtok(NULL, "\n");
+				inc = atof(token);
+				analysis = 'd';
+				printf("--------DC SWEEP: %d---------\n", dcsweep_counter);
+			}
+			else if(!strcmp("tran", token)){ //tran 
+				tran_counter++;
+				start_val = 0; //assume starting time = 0
+				token = strtok(NULL, " ");
+				inc =  atof(token);
+				token = strtok(NULL, "\n");
+				end_val = atof(token);
+				analysis = 't';
+				printf("----------TRAN: %d----------\n", tran_counter);
+				printf("Timestep: %f, final time:%f, method: %c\n", inc, end_val, method);
+			}
+			break; 
+			
+			
+		}
 		else {
-			continue;
+			continue; //for an unrecognizable character
 		}
 		
 		val = atof(val_str);
@@ -348,19 +2403,244 @@ int main(int argc, char *argv[]) {
 		if(strcmp(node2, "0"))
 			insert_ht(ht, node2);
 		
-		list_insert(&list, element, name, node1, node2, node3, node4, model_name, l, w, area, val);	
+		list_insert(&list, &tran_list, element, name, node1, node2, node3, node4, model_name, l, w, area, val, tran_spec);	
 	}
-	dc_mna = create_mna_dc(&list, ht, get_ht_size(ht), m2);
+	//print_tran_list(tran_list);
+	dc_mna = create_mna_dc(&list, ht, get_ht_size(ht), m2, is_sparse);
+		
+	x = (double*)calloc(sizeof(double), get_ht_size(ht) + m2);
+	bdc = (double*)calloc(sizeof(double), get_ht_size(ht) + m2);
+	if(!is_iter){
+		if(!is_sparse){
+			//matrices row
+			L = (double**)calloc(sizeof(double*), get_ht_size(ht) + m2);
+			U = (double**)calloc(sizeof(double*), get_ht_size(ht) + m2);
+			//vectors
+			p = (int*)calloc(sizeof(int), get_ht_size(ht) + m2);
+			pb = (double*)calloc(sizeof(double), get_ht_size(ht) + m2);
+			//metrices cells
+			for(int i = 0; i < (get_ht_size(ht) + m2); i++) {
+				L[i] = (double*)calloc(sizeof(double), get_ht_size(ht) + m2);
+				U[i] = (double*)calloc(sizeof(double), get_ht_size(ht) + m2);
+			}
+		}
+		
+		y = (double*)calloc(sizeof(double), get_ht_size(ht) + m2);
+		
+		solve_direct_dcop(ht, dc_mna, is_spd, L, U, p, pb,x, y,  get_ht_size(ht) + m2, is_sparse);
+	}
+	else{
+		solve_iter_dcop(ht, dc_mna, is_spd, x, itol, get_ht_size(ht) + m2, is_sparse);
+	}
 	
-	print_ht(ht);
-	print_list(list);
-	print_mna_dc(dc_mna);
 	
-	//closing file and freeing dynamicly allocated memory
+	//print_ht(ht);
+	//print_list(list);
+	//print_mna_dc(dc_mna);
+	//print_vector(dc_mna.b, get_ht_size(ht) + m2);
+	
+	while(1){
+		if(fgets(line, IMPORT_LINE_SIZE, fp) == NULL) { //read file line by line
+			break;
+		}
+		
+		//convert string to lowercase characters
+		i = 0;
+		while(line[i] != '\0') {
+			line[i] = tolower(line[i]);
+			i++;
+		}
+		
+		//replace all tabs with whitespaces
+		i = 0;
+		while(line[i] != '\0') {
+			if(line[i] == '\t') {
+				line[i] = ' ';
+			}
+			i++;
+		}
+		//printf("%s\n", line);
+		if(line[0] == '*') { //ignore lines starting with '*'
+			continue;
+		}
+		else if(line[0] == '.'){
+			
+			token = strtok(&line[1], " ");
+			if(!strcmp("dc" , token)){ //dc sweep
+				//If there is a previous sweep before the current
+				if(analysis == 'd'){
+					if(!is_iter)
+						solve_direct_dcsweep(dc_mna, ht, list, out_fp, num_prints, nodes_print, L, U, p, pb, bdc, x, y, input_var, start_val, end_val, inc, is_sparse, is_spd);
+					else{
+						if(is_spd)
+							solve_iter_dcsweep_spd(dc_mna, ht, list, out_fp, num_prints, nodes_print, itol, bdc, x, input_var, start_val, end_val, inc, is_sparse);
+						else
+							solve_iter_dcsweep(dc_mna, ht, list, out_fp, num_prints, nodes_print, itol, bdc, x, input_var, start_val, end_val, inc, is_sparse);
+					}
+					for(int i = 0; i < num_prints; i++){
+						plot_dcsweep(input_var, node_names[i], dcsweep_counter);		
+					}
+					fprintf(stdout, "Click Enter to quit...\n");
+    				getchar();
+							
+				}
+				//If there is a previous tran before the current dcsweep
+				else if(analysis == 't'){
+					if(!is_iter){
+						solve_direct_tran(dc_mna, ht, list, &tran_list, out_fp, num_prints, nodes_print, end_val, inc, is_sparse, is_spd, method);
+					}
+					else{
+						solve_iter_tran(dc_mna, ht, list, &tran_list, out_fp, num_prints, nodes_print, end_val, inc, is_sparse, is_spd, method, itol);
+					}
+					for(int i = 0; i < num_prints; i++){
+						plot_tran(node_names[i], tran_counter);		
+					}
+					fprintf(stdout, "Click Enter to quit...\n");
+    				getchar();
+				}
+				
+				analysis = 'd';
+				token = strtok(NULL, " ");
+				strcpy(input_var, token);
+				token = strtok(NULL, " ");
+				start_val = atof(token);
+				token = strtok(NULL, " ");
+				end_val =  atof(token);
+				token = strtok(NULL, "\n");
+				inc = atof(token);
+				dcsweep_counter++;
+				num_prints = 0;
+				printf("--------DC SWEEP: %d---------\n", dcsweep_counter);	
+			}
+			else if(!strcmp("tran" , token)){
+				//If there is a previous sweep before the current
+				if(analysis == 'd'){
+					if(!is_iter)
+						solve_direct_dcsweep(dc_mna, ht, list, out_fp, num_prints, nodes_print, L, U, p, pb, bdc, x, y, input_var, start_val, end_val, inc, is_sparse, is_spd);
+					else{
+						if(is_spd)
+							solve_iter_dcsweep_spd(dc_mna, ht, list, out_fp, num_prints, nodes_print, itol, bdc, x, input_var, start_val, end_val, inc, is_sparse);
+						else
+							solve_iter_dcsweep(dc_mna, ht, list, out_fp, num_prints, nodes_print, itol, bdc, x, input_var, start_val, end_val, inc, is_sparse);
+					}
+					for(int i = 0; i < num_prints; i++){
+						plot_dcsweep(input_var, node_names[i], dcsweep_counter);		
+					}
+					fprintf(stdout, "Click Enter to quit...\n");
+    				getchar();
+							
+				}
+				//If there is a previous tran before the current tran
+				else if(analysis == 't'){
+					if(!is_iter){
+						solve_direct_tran(dc_mna, ht, list, &tran_list, out_fp, num_prints, nodes_print, end_val, inc, is_sparse, is_spd, method);
+					}
+					else{
+						solve_iter_tran(dc_mna, ht, list, &tran_list, out_fp, num_prints, nodes_print, end_val, inc, is_sparse, is_spd, method, itol);
+					}
+					for(int i = 0; i < num_prints; i++){
+						plot_tran(node_names[i], tran_counter);		
+					}
+					fprintf(stdout, "Click Enter to quit...\n");
+    				getchar();
+				}
+				tran_counter++;
+				start_val = 0; //assume starting time = 0
+				token = strtok(NULL, " ");
+				inc =  atof(token);
+				token = strtok(NULL, "\n");
+				end_val = atof(token);
+				analysis = 't';
+				printf("----------TRAN: %d----------\n", tran_counter);
+				printf("Timestep: %f, final time:%f, method: %c\n", inc, end_val, method);
+			}
+			else if(!strcmp("print" , token) || !strcmp("plot", token)){
+					
+				//parsing nodes to print
+				while((token = strtok(NULL, "v"))){
+					//extracting the node name
+					strcpy(node_name, &token[1]);
+					j = 0;
+					while(node_name[j] != ')'){
+						j++;
+					}
+					node_name[j] = '\0';
+						
+					//printf("Nodes to print: %s -> Hash value: %d\n", node_name, lookup(ht, node_name));
+					if(analysis == 'd')
+						sprintf(out_name, "dcsweep%d_%s_%s", dcsweep_counter, input_var, node_name);
+					else if(analysis == 't')
+						sprintf(out_name, "tran%d_%s", tran_counter, node_name);
+					nodes_print[num_prints] = lookup(ht, node_name);
+					strcpy(node_names[num_prints], node_name); 
+					out_fp[num_prints] = fopen(out_name, "w+");
+					num_prints++;
+				}
+			}
+		}
+		else{
+			continue;
+		}	
+	}
+	
+	if(analysis == 'd'){
+		if(!is_iter)
+			solve_direct_dcsweep(dc_mna, ht, list, out_fp, num_prints, nodes_print, L, U, p, pb, bdc, x, y, input_var, start_val, end_val, inc, is_sparse, is_spd);
+		else{
+			if(is_spd)
+				solve_iter_dcsweep_spd(dc_mna, ht, list, out_fp, num_prints, nodes_print, itol, bdc, x, input_var, start_val, end_val, inc, is_sparse);
+			else
+				solve_iter_dcsweep(dc_mna, ht, list, out_fp, num_prints, nodes_print, itol, bdc, x, input_var, start_val, end_val, inc, is_sparse);
+		}
+		for(int i = 0; i < num_prints; i++){
+			plot_dcsweep(input_var, node_names[i], dcsweep_counter);
+		}
+		fprintf(stdout, "Click Enter to quit...\n");
+    	getchar();	
+	}
+	else if(analysis == 't'){
+		if(!is_iter){
+			solve_direct_tran(dc_mna, ht, list, &tran_list, out_fp, num_prints, nodes_print, end_val, inc, is_sparse, is_spd, method);
+		}
+		else{
+			solve_iter_tran(dc_mna, ht, list, &tran_list, out_fp, num_prints, nodes_print, end_val, inc, is_sparse, is_spd, method, itol);
+		}
+		for(int i = 0; i < num_prints; i++){
+			plot_tran(node_names[i], tran_counter);		
+		}
+		fprintf(stdout, "Click Enter to quit...\n");
+    	getchar();
+	}
+	
+	//closing files and freeing dynamicly allocated memory
 	fclose(fp);
-	delete_ht(ht);
-	list_delete(&list);
-	delete_mna_dc(dc_mna);
 	
+	list_delete(&list, &tran_list);
+	delete_mna_dc(dc_mna, is_sparse, is_iter);
+	
+	free(x);
+	free(bdc);
+	if(!is_iter){
+		free(y);
+		if(!is_sparse){
+			free(pb);
+			free(p);
+			for(int i = 0; i < (get_ht_size(ht) + m2); i++){
+				free(L[i]);
+				free(U[i]);
+			}
+			free(L);
+			free(U);
+		}
+		else{
+			cs_sfree(S);
+			cs_nfree(N);
+		}
+	}
+	delete_ht(ht);
+
 	return 0;
 }
+
+
+
